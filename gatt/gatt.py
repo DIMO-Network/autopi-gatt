@@ -8,7 +8,8 @@ import os
 import struct
 import array
 from enum import Enum
-
+import signal
+import sys
 import dbus
 import dbus.exceptions
 import dbus.mainloop.glib
@@ -28,8 +29,13 @@ import json
 from gatt.eth import sign_message
 from gatt.utils import *
 import subprocess
-from gatt.agent import Agent
+#from gatt.agent import Agent
 from gatt.autoconnect import listDevices
+from optparse import OptionParser
+from gatt import bluezutils
+from subprocess import Popen
+import asyncio
+
 # Mainloop
 MainLoop = None
 try:
@@ -86,7 +92,11 @@ def register_ad_error_cb(error):
     logger.critical("Failed to register advertisement: " + str(error))
     mainloop.quit()
 
-
+def sigint_handler(sig, frame):
+    if sig == signal.SIGINT:
+        mainloop.quit()
+    else:
+        raise ValueError("Undefined handler for '{}'".format(sig))
 # Classes
 
 class AutoPiS1Service(Service):
@@ -101,11 +111,13 @@ class AutoPiS1Service(Service):
     def __init__(self, bus, index):
         Service.__init__(self, bus, index, self.SVC_UUID, True)
         self.add_characteristic(SignedToken(bus, 0, self))
+        self.add_characteristic(RunShellCmd(bus, 1, self))
         IS_PAIRED, OWNER_ETH_ADDRESS, COMMUNICATION_PUBLIC_KEY = getEnvVars()
+
         if(IS_PAIRED):
             self.isPaired = True
             self.comm_key = COMMUNICATION_PUBLIC_KEY
-            self.add_characteristic(CPUTemp(bus, 1, self))
+            self.add_characteristic(CPUTemp(bus, 2, self))
         else:
             self.isPaired = False
             self.comm_key = None
@@ -128,6 +140,17 @@ def dev_connect(path):
 
     dev.Connect()
 
+async def run_cmd(cmd):
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
+    stdout, stderr = await proc.communicate()
+    return stdout.decode()
+
+def format_cmd_output(output):
+    return output[output.index('0x'):-3]
+
 
 class SignedToken(Characteristic):
     uuid = 'ce878653-8c44-4326-84e5-3be6c0fa341f'
@@ -136,7 +159,7 @@ class SignedToken(Characteristic):
     def __init__(self, bus, index, service):
         Characteristic.__init__(
             self, bus, index, self.uuid, [
-                "read", "write"], service,
+                "read", "write", "write-without-response"], service,
         )
 
         self.value = [0xFF]
@@ -144,25 +167,88 @@ class SignedToken(Characteristic):
             CharacteristicUserDescriptionDescriptor(bus, 1, self))
 
     def ReadValue(self, options):
+        #token = {"timestamp": datetime.datetime.now().isoformat()}
+        #signature = sign_message(dump_json(token))
+        ##signature = dump_json(token)
+        #signedToken = dump_json({"token": token, "signature": signature})
+        #logger.info(signedToken)
+        #return str.encode(signedToken)
 
-        token = {"timestamp": datetime.datetime.now().isoformat()}
-        signature = sign_message(dump_json(token))
-        #signature = dump_json(token)
-        signedToken = dump_json({"token": token, "signature": signature})
-        logger.info(signedToken)
-        return str.encode(signedToken)
+        try:
+            out_put = open('./cmd_output.txt', 'r', encoding='utf-8')
+            txt = out_put.read()
+            logger.warning(txt)
+            return str.encode(txt)
+        except:
+            logger.warning('something went wrong reading file...')
+
+        return str.encode('unsuccessful')
+
 
     def WriteValue(self, value, options):
-        logger.info(options)
-        logger.info(options["device"])
-        dev_disconnect(options["device"])
-        logger.info("Test Write: " + repr(value))
-        cmd = bytes(value).decode("utf-8")
-        logger.info("Decoded: " + cmd)
+        #logger.info(options)
+        #logger.info(options["device"])
+        #dev_disconnect(options["device"])
+        #logger.info("Test Write: " + repr(value))
+        #cmd = bytes(value).decode("utf-8")
+        #logger.info("Decoded: " + cmd)
         #os.system('autopi audio.speak "' + cmd + '"')
+        hashed_payload = bytearray(value).decode()
+        logger.warning('hashed payload: ' + hashed_payload)
 
-        return None
+        try:
+            eth_add = asyncio.run(run_cmd('autopi crypto.query ethereum_address'))
+            signature = asyncio.run(run_cmd('autopi crypto.sign_string {}'.format(hashed_payload)))
+            logger.warning('cmd outputs: ')
+            logger.warning('address: ' + format_cmd_output(eth_add))
+            logger.warning('signature: ' + format_cmd_output(signature))
+            cmd = "{} {}".format(format_cmd_output(eth_add),format_cmd_output(signature))
+            logger.warning(cmd)
+            f = open('cmd_output.txt', 'w+')
+            f.write(cmd)
+            f.close()
+        except:
+            logger.warning('something went wrong writing a file...')
 
+class RunShellCmd(Characteristic):
+    uuid = 'ce878655-8c44-4326-84e5-3be6c0fa341f'
+    description = b'Run shell commands'
+
+    def __init__(self, bus, index, service):
+        Characteristic.__init__(
+            self, bus, index, self.uuid, [
+                "read", "write", "write-without-response"], service,
+        )
+
+    def ReadValue(self, options):
+        try:
+            out_put = open('./cmd_output.txt', 'r', encoding='utf-8')
+            txt = out_put.read()
+            logger.warning(txt)
+            return str.encode(txt)
+        except:
+            logger.warning('something went wrong reading file...')
+
+        return str.encode('unsuccessful')
+
+
+    def WriteValue(self, value, options):
+        cmd = bytearray(value).decode()
+        logger.warning('cmd: ' + cmd)
+
+        try:
+            cmd_output = asyncio.run(run_cmd('autopi {}'.format(cmd)))
+            if not cmd_output:
+                cmd_output = 'error:' + cmd;
+            logger.warning('cmd output: ' + cmd_output)
+            f = open('./cmd_output.txt', 'w+')
+            f.write(cmd_output)
+            f.close()
+        except:
+            logger.warning('something went wrong writing a file...')
+            f = open('./cmd_output.txt', 'w+')
+            f.write('error thrown when executing:' + cmd)
+            f.close()
 
 class CPUTemp(Characteristic):
     uuid = 'ce878654-8c44-4326-84e5-3be6c0fa341f'
@@ -280,15 +366,45 @@ def main():
     advertisement = AutoPiAdvertisement(bus, 0)
     obj = bus.get_object(BLUEZ_SERVICE_NAME, "/org/bluez")
 
-    logger.info("Registering agent")
-    capability = "NoInputNoOutput"
-    agent_path = "/dimo/agent"
-    agent = Agent(bus, agent_path)
+    #logger.info("Registering agent")
+    #capability = "NoInputNoOutput"
+    #parser = OptionParser()
+    #parser.add_option("-i", "--adapter", action="store",type="string",dest="adapter_pattern",default=None)
+    #parser.add_option("-c", "--capability", action="store",type="string", dest="capability")
+    #parser.add_option("-t", "--timeout", action="store",type="int", dest="timeout",default=60000)
+    #(options, args) = parser.parse_args()
+    #if options.capability:
+    #    capability  = options.capability
+    #path = "/dimo/agent2"
+    #agent = Agent(bus, path)
+    #ag_manager = dbus.Interface(obj, "org.bluez.AgentManager1")
+    #ag_manager.RegisterAgent(path, capability)
+    #
+    ## Fix-up old style invocation (BlueZ 4)
+    #if len(args) > 0 and args[0].startswith("hci"):
+    #    options.adapter_pattern = args[0]
+    #    del args[:1]
+    #
+    #if len(args) > 0:
+    #    device = bluezutils.find_device(args[0],
+	#					options.adapter_pattern)
+    #    dev_path = device.object_path
+    #    agent.set_exit_on_release(False)
+    #    device.Pair(reply_handler=pair_reply, error_handler=pair_error,
+	#							timeout=60000)
+    #    device_obj = device
+    #else:
+    #    ag_manager.RequestDefaultAgent(path)
 
-    agent_manager = dbus.Interface(obj, "org.bluez.AgentManager1")
-    agent_manager.RegisterAgent(agent_path, capability)
-    agent_manager.RequestDefaultAgent(agent_path)
-    logger.info("Agent registered")
+    #agent_path = "/dimo/agent"
+    #agent = Agent(bus, agent_path)
+    #
+    #agent_manager = dbus.Interface(obj, "org.bluez.AgentManager1")
+    #agent_manager.RegisterAgent(agent_path, capability)
+    #agent_manager.RequestDefaultAgent(agent_path)
+    #os.system('python3 /usr/local/lib/python3.7/dist-packages/gatt/agent2.py')
+    #logger.info("Agent registered")
+
     # logger.info("Attempting to connect to trusted devices")
 
     # try:
@@ -320,6 +436,8 @@ def main():
         reply_handler=register_app_cb,
         error_handler=register_app_error_cb,
     )
+
+    signal.signal(signal.SIGINT, sigint_handler)
 
     mainloop.run()
 
